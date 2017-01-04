@@ -33,10 +33,13 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import org.jboss.msc.util.TestServiceListener;
 import org.jboss.msc.value.Values;
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -67,6 +70,37 @@ public class MultipleDependenciesTestCase extends AbstractServiceTest {
         dependenciesField.setAccessible(true);
     }
 
+    @Test
+    public void testSomeThings2() throws Exception {
+        ServiceName dependent = ServiceName.JBOSS.append("dependent");
+        for(int i = 0; i < 10000; ++i) {
+            ServiceController<Void> c2 = serviceContainer.addService(ServiceName.JBOSS.append("dependee"), Service.NULL)
+                    .addDependency(dependent).install();
+            ServiceController<Void> c1 = serviceContainer.addService(dependent, Service.NULL).install();
+            final CountDownLatch latch = new CountDownLatch(1);
+            c1.addListener(new AbstractServiceListener<Void>() {
+                @Override
+                public void transition(ServiceController<? extends Void> controller, ServiceController.Transition transition) {
+                    if (transition.getAfter() == ServiceController.Substate.REMOVED) {
+                        latch.countDown();
+                    }
+                }
+            });
+            c1.setMode(ServiceController.Mode.REMOVE);
+            latch.await();
+            c1 = serviceContainer.addService(dependent, Service.NULL).install();
+            if(!serviceContainer.awaitStability(5, TimeUnit.SECONDS)) {
+                serviceContainer.dumpServices();
+                Assert.fail();
+            }
+            c2.setMode(ServiceController.Mode.REMOVE);
+            c1.setMode(ServiceController.Mode.REMOVE);
+            if(!serviceContainer.awaitStability(5, TimeUnit.SECONDS)) {
+                serviceContainer.dumpServices();
+                Assert.fail();
+            }
+        }
+    }
     @Test
     public void test() throws Exception {
         serviceContainer.addListener(listener);
