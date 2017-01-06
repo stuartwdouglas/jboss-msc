@@ -29,29 +29,25 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
-import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.lang.reflect.Field;
-import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import javax.management.InstanceNotFoundException;
-import javax.management.MBeanException;
 import javax.management.MBeanServerConnection;
-import javax.management.MalformedObjectNameException;
 import javax.management.ObjectName;
-import javax.management.ReflectionException;
 
 import org.jboss.modules.management.ObjectProperties;
 import org.jboss.msc.util.TestServiceListener;
+import org.jboss.msc.value.InjectedValue;
 import org.jboss.msc.value.Values;
 import org.junit.Assert;
 import org.junit.Before;
@@ -72,11 +68,16 @@ public class MultipleDependenciesTestCase extends AbstractServiceTest {
     private static final ServiceName secondServiceName = ServiceName.of("secondService");
     private static final ServiceName thirdServiceName = ServiceName.of("thirdService");
     private static final ServiceName fourthServiceName = ServiceName.of("fourthService");
+
+    private static final AtomicInteger stopCount = new AtomicInteger();
+    private static final AtomicInteger startCount = new AtomicInteger();
     private TestServiceListener listener;
 
     @Before
     public void setUpTestListener() {
         listener = new TestServiceListener();
+        stopCount.set(0);
+        startCount.set(0);
     }
 
     @BeforeClass
@@ -85,9 +86,69 @@ public class MultipleDependenciesTestCase extends AbstractServiceTest {
         dependenciesField.setAccessible(true);
     }
 
+    /**
+     * multiTierRestartTest variant.
+     * Here we do not wait for stability when the grandchild service
+     * wants to restart its grandparent service.
+     * Currently expected to fail intermittently
+     */
     @Test
     public void testSomeThings2() throws Exception {
-        for(int i = 0; i < 100000; ++i) {
+        multiTierRestartTest(true, false);
+    }
+
+    /**
+     * multiTierRestartTest variant.
+     * Here we  wait for stability when the grandchild service
+     * wants to restart its grandparent service.  But the test driver does
+     * not wait for stability following stopping the s1 parent before
+     * it starts it again.
+     * Currently expected to fail intermittently
+     */
+    @Test
+    public void testDeferredMultiTierRestart() throws Exception {
+        multiTierRestartTest(false, false);
+    }
+
+    /**
+     * multiTierRestartTest variant.
+     * Here we  wait for stability when the grandchild service
+     * wants to restart its grandparent service.  Plus the test driver
+     * waits for stability following stopping the s1 parent before
+     * it starts it again.
+     * This is not expected to fail.
+     */
+    @Test
+    public void testDeferredMultiTierRestartWithStabilityDelay() throws Exception {
+        multiTierRestartTest(false, true);
+    }
+
+    /**
+     * Tests of a multi-tiered hierarchy of related service sets. Each set has three services with parent/child/grandchild
+     * relationship, and with the "child" services also having dependency relationships between sets, with s3 depending
+     * on s2 and s2 depending on s1 (so a 3 tier hierarchy between sets.) The grandchild services have special logic
+     * such that if they detect they have been started more than once, their start does not proceed normally; rather
+     * it invokes logic such that the "parent" in their set is started and then restopped.
+     *
+     * The test stops the s1 parent service and then immediately restarts it.
+     *
+     * All of this models behavior found in WildFly Core's deployment service handling. The stopping and restarting
+     * behavior there has resulted in bug reports.
+     *
+     * @param immediateRestart {@code true} if the grandchild's restart of its grandparent should proceed immediately;
+     *                         {@code false} if it should wait for container stability following the s1 restart
+     * @param stabilizeBeforeReinstall {@code true} if following the s1 parent stop a pause for stability should
+     *                                 happen before s1 parent is started again. {@code false} if the start should
+     *                                 not wait for stability
+     */
+    private void multiTierRestartTest(boolean immediateRestart, boolean stabilizeBeforeReinstall) throws Exception {
+
+        // Install a special service to handle stability delays and stability checks
+        ConsistencyHandler consistencyHandler = new ConsistencyHandler();
+        ServiceController<ConsistencyHandler> ch = serviceContainer.addService(ConsistencyHandler.SERVICE_NAME, consistencyHandler).install();
+
+        final int loops = 100000;
+        for(int i = 0; i < loops; ++i) {
 
             ServiceName s3 = ServiceName.JBOSS.append("s3");
             ServiceName s2 = ServiceName.JBOSS.append("s2");
@@ -108,22 +169,54 @@ public class MultipleDependenciesTestCase extends AbstractServiceTest {
                     }
                 }
             });
+
+            // Model an operation that restarts the service set (s1) the others depend on
+
+            if (!immediateRestart) {
+                // Signal the consistency handler that it needs to defer restart requests
+                consistencyHandler.deferRestarts();
+            }
+
             c1.setMode(ServiceController.Mode.REMOVE);
             latch.await();
+            if (stabilizeBeforeReinstall) {
+                if(!serviceContainer.awaitStability(2, TimeUnit.SECONDS)) {
+                    dumpDetails();
+                    Assert.fail();
+                }
+            }
             c1 = serviceContainer.addService(s1, new RootService(s1))
                     .install();
-            if(!serviceContainer.awaitStability(2, TimeUnit.SECONDS)) {
+            if(!consistencyHandler.awaitStability(serviceContainer,2, TimeUnit.SECONDS)) {
                 dumpDetails();
                 Assert.fail();
             }
+
+            // Model an operation the removes the 3 service sets
+
+            if (!immediateRestart) {
+                // Signal the consistency handler that it needs to defer restart requests
+                consistencyHandler.deferRestarts();
+            }
+
             c1.setMode(ServiceController.Mode.REMOVE);
             c2.setMode(ServiceController.Mode.REMOVE);
             c3.setMode(ServiceController.Mode.REMOVE);
-            if(!serviceContainer.awaitStability(2, TimeUnit.SECONDS)) {
+            if(!consistencyHandler.awaitStability(serviceContainer, 2, TimeUnit.SECONDS)) {
                 dumpDetails();
                 Assert.fail();
             }
         }
+
+        // Final cleanup
+
+        ch.setMode(ServiceController.Mode.REMOVE);
+        if(!serviceContainer.awaitStability(2, TimeUnit.SECONDS)) {
+            dumpDetails();
+            Assert.fail();
+        }
+
+        System.out.println("With immediate restart '" + immediateRestart + "' over " + loops + " tests root service stop count was " + stopCount.get() + " and start count was " + startCount.get());
     }
 
     private void dumpDetails() throws Exception {
@@ -142,6 +235,8 @@ public class MultipleDependenciesTestCase extends AbstractServiceTest {
         System.out.println(sb);
     }
 
+
+    /** The parent service in the multiTierRestartTest. */
     private class RootService extends AbstractService<Void> {
         final ServiceName baseName;
         private final ServiceName[] serviceNames;
@@ -154,8 +249,10 @@ public class MultipleDependenciesTestCase extends AbstractServiceTest {
         @Override
         public void start(final StartContext context) throws StartException {
             ServiceName module = baseName.append(MODULE);
-            context.getChildTarget().addService(baseName.append("firstModuleUse"), new FirstModuleUseService())
+            FirstModuleUseService service = new FirstModuleUseService();
+            context.getChildTarget().addService(baseName.append("firstModuleUse"), service)
                     .addDependency(module)
+                    .addDependency(ConsistencyHandler.SERVICE_NAME, ConsistencyHandler.class, service.consistencyHandlerInjectedValue)
                     .install();
             context.getChildTarget().addService(module, Service.NULL)
                     .addDependencies(serviceNames)
@@ -163,8 +260,14 @@ public class MultipleDependenciesTestCase extends AbstractServiceTest {
         }
     }
 
+    /**
+     * The grandchild service in the multiTierRestartTest.
+     * Name reflects a service in WildFly that was important
+     * in bug reports.
+     */
     private class FirstModuleUseService extends AbstractService<Void> {
 
+        private InjectedValue<ConsistencyHandler> consistencyHandlerInjectedValue = new InjectedValue<ConsistencyHandler>();
         boolean first = true;
 
         @Override
@@ -173,17 +276,118 @@ public class MultipleDependenciesTestCase extends AbstractServiceTest {
                 first = false;
             } else {
                 first = true;
-                context.getController().getParent().addListener(new AbstractServiceListener() {
+                consistencyHandlerInjectedValue.getValue().serviceRequiresRestart(context.getController().getParent());
+            }
+        }
+    }
+
+    /** Handles grandparent service restart as well as service container stability checking for multiTierRestartTest. */
+    private static class ConsistencyHandler extends AbstractService<ConsistencyHandler> {
+
+        static final ServiceName SERVICE_NAME = ServiceName.of("consistencyHandler");
+
+        private final Set<ServiceController<?>> controllersToStop = new HashSet<ServiceController<?>>();
+        private final Set<ServiceController<?>> controllersToStart = new HashSet<ServiceController<?>>();
+        private final AtomicBoolean deferRestarts = new AtomicBoolean();
+
+
+        public void serviceRequiresRestart(ServiceController toRestart) {
+            if (deferRestarts.get()) {
+                synchronized (controllersToStop) {
+                    controllersToStop.add(toRestart);
+                }
+            } else {
+                // We're not testing deferring restart until stable.
+                // Just restart immediately
+                restartService(toRestart, true);
+            }
+        }
+
+        void deferRestarts() {
+            deferRestarts.set(true);
+        }
+
+        boolean awaitStability(ServiceContainer serviceContainer, long timeout, TimeUnit unit) throws InterruptedException {
+            try {
+                boolean loop;
+                do {
+                    loop = false;
+                    if (!serviceContainer.awaitStability(timeout, unit)) {
+                        return false;
+                    }
+
+                    Set<ServiceController<?>> stopClone = null;
+                    synchronized (controllersToStop) {
+                        if (!controllersToStop.isEmpty()) {
+                            assertTrue(deferRestarts.get());
+                            stopClone = new HashSet<ServiceController<?>>(controllersToStop);
+                            controllersToStop.clear();
+                        }
+                    }
+                    if (stopClone != null) {
+                        loop = true;
+                        for (ServiceController<?> svcController : stopClone) {
+                            restartService(svcController, false);
+                        }
+
+                        if (!serviceContainer.awaitStability(timeout, unit)) {
+                            return false;
+                        }
+                    }
+
+                    Set<ServiceController<?>> startClone = null;
+                    synchronized (controllersToStart) {
+                        if (!controllersToStart.isEmpty()) {
+                            assertTrue(deferRestarts.get());
+                            startClone = new HashSet<ServiceController<?>>(controllersToStart);
+                            controllersToStart.clear();
+                        }
+                    }
+
+                    if (startClone != null) {
+                        loop = true;
+                        for (ServiceController<?> svcController : startClone) {
+                            if (svcController.getState() != ServiceController.State.REMOVED) {
+                                svcController.setMode(ServiceController.Mode.ACTIVE);
+                                startCount.incrementAndGet();
+                            }
+                        }
+                    }
+                } while (loop);
+
+                return true;
+            } finally {
+                deferRestarts.set(false);
+            }
+
+        }
+
+        private void restartService(final ServiceController serviceController, final boolean immediateActivate) {
+            if (serviceController.getState() != ServiceController.State.REMOVED) {
+                serviceController.addListener(new AbstractServiceListener() {
                     @Override
                     public void transition(ServiceController controller, ServiceController.Transition transition) {
                         if(transition.getAfter() == ServiceController.Substate.DOWN) {
-                            controller.setMode(ServiceController.Mode.ACTIVE);
+                            if (immediateActivate) {
+                                controller.setMode(ServiceController.Mode.ACTIVE);
+                                startCount.incrementAndGet();
+                            } else {
+                                synchronized (controllersToStart) {
+                                    controllersToStart.add(controller);
+                                }
+                            }
                             controller.removeListener(this);
                         }
                     }
                 });
-                context.getController().getParent().setMode(ServiceController.Mode.NEVER);
+                serviceController.setMode(ServiceController.Mode.NEVER);
+                stopCount.incrementAndGet();
             }
+        }
+
+        @Override
+        public ConsistencyHandler getValue() throws IllegalStateException {
+            return this;
         }
     }
 
