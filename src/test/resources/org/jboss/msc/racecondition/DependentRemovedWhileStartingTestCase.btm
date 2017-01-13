@@ -20,6 +20,16 @@
 # 02110-1301 USA, or see the FSF site: http://www.fsf.org.
 #
 
+RULE createCountdown
+CLASS org.jboss.msc.racecondition.DependentRemovedWhileStartingTestCase
+METHOD testRemoveWhileServiceStarts
+AT ENTRY
+BIND NOTHING
+IF TRUE
+DO
+   createCountDown("count", 1);
+ENDRULE
+
 RULE delay remove task
 CLASS org.jboss.msc.service.ServiceControllerImpl$RemoveTask
 METHOD run
@@ -36,11 +46,12 @@ CLASS org.jboss.msc.service.ServiceControllerImpl$ServiceUnavailableTask
 METHOD run
 AT EXIT
 BIND NOTHING
-IF $0.this$0.primaryRegistration.name.toString().contains("dependee")
+IF $0.this$0.primaryRegistration.name.toString().contains("dependee") and not countDown("count")
 DO
    debug("signal wake for dependee unregistered"),
    signalWake("dependee-unregistered", true);
 ENDRULE
+
 
 
 RULE wait for signal to install

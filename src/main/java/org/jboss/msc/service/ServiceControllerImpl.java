@@ -552,7 +552,7 @@ final class ServiceControllerImpl<S> implements ServiceController<S>, Dependent 
                 }
                 case DOWN_to_WONT_START: {
                     getListenerTasks(transition, tasks);
-                    tasks.add(new ServiceUnavailableTask());
+                    tasks.add(new ServiceUnavailableTask(false));
                     break;
                 }
                 case WONT_START_to_DOWN: {
@@ -664,7 +664,7 @@ final class ServiceControllerImpl<S> implements ServiceController<S>, Dependent 
                     break;
                 }
                 case DOWN_to_REMOVING: {
-                    tasks.add(new ServiceUnavailableTask());
+                    tasks.add(new ServiceUnavailableTask(true));
                     Dependent[][] dependents = getDependents();
                     // Clear all dependency uninstalled flags from dependents
                     if (!immediateUnavailableDependencies.isEmpty() || transitiveUnavailableDepCount > 0) {
@@ -1858,18 +1858,22 @@ final class ServiceControllerImpl<S> implements ServiceController<S>, Dependent 
 
         private final Map<ServiceName, Dependent[]> dependents;
         private final Dependent[] children;
+        private final boolean removing;
 
-        ServiceUnavailableTask() {
+        ServiceUnavailableTask(boolean removing) {
+            this.removing = removing;
             dependents = getDependentsByDependencyName();
             children = ServiceControllerImpl.this.children.toScatteredArray(NO_DEPENDENTS);
         }
 
         public void run() {
             try {
-                for (Map.Entry<ServiceName, Dependent[]> dependentEntry: dependents.entrySet()) {
-                    ServiceName serviceName = dependentEntry.getKey();
-                    for (Dependent dependent: dependentEntry.getValue()) {
-                        if (dependent != null) dependent.immediateDependencyUnavailable(serviceName);
+                if(!removing) {
+                    for (Map.Entry<ServiceName, Dependent[]> dependentEntry : dependents.entrySet()) {
+                        ServiceName serviceName = dependentEntry.getKey();
+                        for (Dependent dependent : dependentEntry.getValue()) {
+                            if (dependent != null) dependent.immediateDependencyUnavailable(serviceName);
+                        }
                     }
                 }
                 final ServiceName primaryRegistrationName = primaryRegistration.getName();

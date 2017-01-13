@@ -23,6 +23,7 @@
 package org.jboss.msc.service;
 
 import java.util.ArrayList;
+import java.util.List;
 
 import static java.lang.Thread.holdsLock;
 
@@ -33,6 +34,7 @@ import static java.lang.Thread.holdsLock;
  */
 final class ServiceRegistrationImpl implements Dependency {
 
+    private static final Dependent[] NO_DEPENDENTS = new Dependent[0];
 
     /**
      * The service container which contains this registration.
@@ -164,12 +166,19 @@ final class ServiceRegistrationImpl implements Dependency {
 
     void clearInstance(final ServiceControllerImpl<?> oldInstance) {
         assert ! holdsLock(this);
+        Dependent[] dependentList;
         synchronized (this) {
             final ServiceControllerImpl<?> instance = this.instance;
             if (instance != oldInstance) {
                 return;
             }
-            this.instance = null;
+            synchronized (dependents) {
+                this.instance = null;
+                dependentList = dependents.toScatteredArray(NO_DEPENDENTS);
+            }
+        }
+        for(Dependent dependent : dependentList) {
+            if(dependent != null) dependent.immediateDependencyUnavailable(name);
         }
     }
 
